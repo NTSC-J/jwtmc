@@ -4,21 +4,26 @@ import asyncio
 import random
 import sys
 import json
+import time
 from jwcrypto import jwt, jwk
 from jwcrypto.jwt import JWT
 from jwcrypto.jwk import JWK, JWKSet
 
 # init
-# 1. C -> S: {"type": "init_ctr", "nonce": 12345} (signed by C)
-# 2. S -> C: {"type": "init_ctr_ok", "key": 1234, "nonce": 12345, "v": 42} (signed by S)
+# 1. C -> S: {"msgtype": "ctr_init", "nonce": 12345} (signed by C)
+# 2. S -> C: {"msgtype": "ctr_init_ok", "key": 1234, "nonce": 12345, "v": 42} (signed by S)
 
 # access
-# 1. C -> S: {"type": "access", "nonce0": 12346, "key": 1234, "inc": 1}
-# 2. S -> C: {"type": "access_ack0", "nonce0": 12346, "nonce1": 23456}
-# 3. C -> S: {"type": "access_ack1", "nonce0": 12346, "nonce1": 23456}
-# 4. S -> C: {"type": "access_ok", "nonce0": 12346, "nonce1": 23456, "v": 43}
+# 1. C -> S: {"msgtype": "ctr_access", "nonce0": 12346, "key": 1234, "inc": 1}
+# 2. S -> C: {"msgtype": "ctr_access_ack0", "nonce0": 12346, "nonce1": 23456}
+# 3. C -> S: {"msgtype": "ctr_access_ack1", "nonce0": 12346, "nonce1": 23456}
+# 4. S -> C: {"msgtype": "ctr_access_ok", "nonce0": 12346, "nonce1": 23456, "v": 43}
 
-# error: {"type": "error", "info": "invalid_signature"/"invalid_request"/"nonce_mismatch"}
+# time
+# 1. C -> S: {"msgtype": "time_query", "nonce": 12347}
+# 2. S -> C: {"msgtype": "time_answer", "nonce": 12347, "time": 1601286372.123} (seconds from epoch)
+
+# error: {"msgtype": "error", "info": "invalid_signature"/"invalid_request"/"nonce_mismatch"}
 
 class MCData:
     """モノトニックカウンタサーバに保存されるデータ"""
@@ -49,9 +54,12 @@ class MCData:
 
 # メッセージは改行区切りのJWT
 async def read(reader, key = None):
-    return JWT(jwt = (await reader.readline()).decode('utf-8').strip(), key = key)
+    s = (await reader.readline()).decode('utf-8').strip()
+    print(f'read: {s}')
+    return JWT(jwt = s, key = key)
 
 async def write(writer, claims, signing_key):
+    print(f'write: {claims}')
     msg = JWT(header = {'alg': 'RS256'}, claims = claims)
     msg.make_signed_token(signing_key)
     writer.write((msg.serialize() + '\n').encode('utf-8'))
@@ -72,17 +80,17 @@ class MCServer:
             req.token.objects['valid'] = True
             reqclaims = json.loads(req.token.payload.decode('utf-8'))
 
-            reqtype = reqclaims['type']
-            if reqtype == 'init_ctr': # カウンタの初期化
+            reqtype = reqclaims['msgtype']
+            if reqtype == 'ctr_init': # カウンタの初期化
                 nonce = reqclaims['nonce']
                 client_pubkey = JWK.from_json(reqclaims['pubkey'])
 
                 vinit = 42 # TODO: 適切な初期値
                 key = self.data.add_new(vinit, client_pubkey)
 
-                await write(writer, {'type': 'init_ctr_ok', 'nonce': nonce, 'key': key, 'ctr': vinit})
+                await write(writer, {'msgtype': 'ctr_init_ok', 'nonce': nonce, 'key': key, 'ctr': vinit}, self.privkey)
 
-            elif reqtype == 'access': # カウンタに0以上加算して結果を返す
+            elif reqtype == 'ctr_access': # カウンタに0以上加算して結果を返す
                 nonce0 = reqclaims['nonce0']
                 key = reqclaims['key']
                 inc = reqclaims['inc']
@@ -94,34 +102,41 @@ class MCServer:
                 try:
                     req.token.verify(client_pubkey)
                 except InvalidJWSSignature:
-                    await write(writer, {'type': 'error', 'info': 'invalid_signature'})
+                    await write(writer, {'msgtype': 'error', 'info': 'invalid_signature'}, self.privkey)
                     return
 
                 nonce1 = random.randrange(2 ** 64)
-                await write(writer, {'type': 'access_ack0', 'nonce0': nonce0, 'nonce1': nonce1})
+                await write(writer, {'msgtype': 'ctr_access_ack0', 'nonce0': nonce0, 'nonce1': nonce1}, self.privkey)
 
                 req1 = await read(client_pubkey)
                 # TODO: 署名検証の例外処理
                 req1claims = json.loads(req1.claims)
 
-                if req1claims['type'] != 'access_ack1':
-                    await write(writer, {'type': 'error', 'info': 'invalid_request'})
+                if req1claims['msgtype'] != 'ctr_access_ack1':
+                    await write(writer, {'msgtype': 'error', 'info': 'invalid_request'}, self.privkey)
                     return
                 if req1claims['nonce0'] != nonce0 or req1claims['nonce1'] != nonce1:
-                    await write(writer, {'type': 'error', 'info': 'nonce_mismatch'})
+                    await write(writer, {'msgtype': 'error', 'info': 'nonce_mismatch'}, self.privkey)
                     return
 
                 v = self.data.increment(key, inc)
-                await write(writer, {'type': 'access_ok', 'nonce0': nonce0, 'nonce1': nonce1, 'v': v})
+                await write(writer, {'msgtype': 'ctr_access_ok', 'nonce0': nonce0, 'nonce1': nonce1, 'v': v}, self.privkey)
+
+            elif reqtype == 'time_query': # 時刻のクエリ
+                # クエリの署名検証はしない
+                nonce = reqclaims["nonce"]
+                t = time.time()
+
+                await write(writer, {'msgtype': 'time_answer', 'time': t, 'nonce': nonce}, self.privkey)
 
             else: # 不明なリクエスト
-                await write(writer, {'type': 'error', 'info': 'invalid_request'})
+                await write(writer, {'msgtype': 'error', 'info': 'invalid_request'}, self.privkey)
 
         except (KeyError, ValueError):
-            await write(writer, {'type': 'error', 'info': 'invalid_request'})
+            await write(writer, {'msgtype': 'error', 'info': 'invalid_request'}, self.privkey)
 
         except InvalidJWSSignature:
-            await write(writer, {'type': 'error', 'info': 'invalid_signature'})
+            await write(writer, {'msgtype': 'error', 'info': 'invalid_signature'}, self.privkey)
 
         finally:
             writer.close()
@@ -147,12 +162,12 @@ class MCClient:
     async def init_ctr(self):
         try:
             reader, writer = await asyncio.open_connection(self.host, self.port)
-            nonce = random.randrange(2 ** 64)
+            nonce = random.randrange(2 ** 32)
             pubkey = self.privkey.export_public()
-            await write(writer, {'type': 'init_ctr', 'nonce': nonce, 'pubkey': pubkey}, self.privkey)
+            await write(writer, {'msgtype': 'ctr_init', 'nonce': nonce, 'pubkey': pubkey}, self.privkey)
             res = await read(reader, self.server_pubkey)
             resclaims = json.loads(res.claims)
-            if resclaims['type'] == 'init_ctr_ok':
+            if resclaims['msgtype'] == 'ctr_init_ok':
                 if resclaims['nonce'] != nonce:
                     print('init_ctr: nonce mismatch')
                     raise Exception('nonce mismatch')
@@ -176,12 +191,12 @@ class MCClient:
         try:
             reader, writer = await asyncio.open_connection(self.host, self.port)
 
-            nonce0 = random.randrange(2 ** 64)
-            await write(writer, {'type': 'access', 'nonce0': nonce0, 'key': self.key, 'inc': inc}, self.privkey)
+            nonce0 = random.randrange(2 ** 32)
+            await write(writer, {'msgtype': 'ctr_access', 'nonce0': nonce0, 'key': self.key, 'inc': inc}, self.privkey)
 
             res = await read(reader, self.server_pubkey)
             resclaims = json.loads(res.claims)
-            if resclaims['type'] != 'access_ack0':
+            if resclaims['msgtype'] != 'ctr_access_ack0':
                 print(f'access failed: {res.claims}')
                 raise Exception('access failed')
             if resclaims['nonce0'] != nonce0:
@@ -189,11 +204,11 @@ class MCClient:
                 raise Exception('nonce mismatch')
             nonce1 = resclaims['nonce1']
 
-            await write(writer, {'type': 'access_ack1', 'nonce0': nonce0, 'nonce1': nonce1}, self.privkey)
+            await write(writer, {'msgtype': 'ctr_access_ack1', 'nonce0': nonce0, 'nonce1': nonce1}, self.privkey)
 
             res = await read(reader, self.server_pubkey)
             resclaims = json.loads(res.claims)
-            if resclaims['type'] != 'access_ok':
+            if resclaims['msgtype'] != 'ctr_access_ok':
                 print(f'access failed: {res.claims}')
                 raise Exception('access failed')
             if resclaims['nonce0'] != nonce0 or resclaims['nonce1'] != nonce1:
@@ -208,6 +223,26 @@ class MCClient:
             writer.close()
             await writer.wait_closed()
 
+    async def query_time(self):
+        reader, writer = await asyncio.open_connection(self.host, self.port)
+
+        nonce = random.randrange(2 ** 32)
+        await write(writer, {'msgtype': 'time_query', 'nonce': nonce}, self.privkey)
+
+        res = await read(reader, self.server_pubkey)
+        resclaims = json.loads(res.claims)
+        if resclaims['msgtype'] != 'time_answer':
+            print(f'access failed: {res.claims}')
+            return
+        if resclaims['nonce'] != nonce:
+            print('nonce mismatch')
+            return
+
+        writer.close()
+        await writer.wait_closed()
+
+        return resclaims['time']
+
     def set_key(self, key):
         self.key = key
 
@@ -217,6 +252,7 @@ CLI_HELP = """commands:
 init_ctr
 access inc
 set_key key
+query_time
 help
 """
 
@@ -229,6 +265,8 @@ async def main(argv):
             await client.access(int(sline[1]))
         elif len(sline) == 2 and sline[0] == 'set_key':
             client.set_key(int(sline[1]))
+        elif len(sline) == 1 and sline[0] == 'query_time':
+            print(await client.query_time())
         elif line == 'help':
             print(CLI_HELP, end='')
         else:
