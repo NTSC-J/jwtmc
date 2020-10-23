@@ -11,13 +11,13 @@ from jwcrypto.jwk import JWK, JWKSet
 
 # init
 # 1. C -> S: {"msgtype": "ctr_init", "nonce": 12345} (signed by C)
-# 2. S -> C: {"msgtype": "ctr_init_ok", "key": 1234, "nonce": 12345, "v": 42} (signed by S)
+# 2. S -> C: {"msgtype": "ctr_init_ok", "key": 1234, "nonce": 12345, "ctr": 42} (signed by S)
 
 # access
 # 1. C -> S: {"msgtype": "ctr_access", "nonce0": 12346, "key": 1234, "inc": 1}
 # 2. S -> C: {"msgtype": "ctr_access_ack0", "nonce0": 12346, "nonce1": 23456}
 # 3. C -> S: {"msgtype": "ctr_access_ack1", "nonce0": 12346, "nonce1": 23456}
-# 4. S -> C: {"msgtype": "ctr_access_ok", "nonce0": 12346, "nonce1": 23456, "v": 43}
+# 4. S -> C: {"msgtype": "ctr_access_ok", "nonce0": 12346, "nonce1": 23456, "ctr": 43}
 
 # time
 # 1. C -> S: {"msgtype": "time_query", "nonce": 12347}
@@ -32,9 +32,9 @@ class MCData:
         self.known_keys = JWKSet()
 
     def add_new(self, v, pubkey):
-        k = random.randrange(2 ** 64)
+        k = random.randrange(2 ** 32)
         while k in self.ctr:
-            k = random.randramge(2 ** 64)
+            k = random.randramge(2 ** 32)
 
         self.ctr[k] = [v, pubkey]
         self.known_keys.add(pubkey)
@@ -55,8 +55,8 @@ class MCData:
 # メッセージは改行区切りのJWT
 async def read(reader, key = None):
     s = (await reader.readline()).decode('utf-8').strip()
-    print(f'read: {s}')
-    return JWT(jwt = s, key = key)
+    r = JWT(jwt = s, key = key)
+    return r
 
 async def write(writer, claims, signing_key):
     print(f'write: {claims}')
@@ -79,8 +79,10 @@ class MCServer:
             # jwcryptoではJWTの署名を検証する前にペイロードにアクセスする良い方法がない
             req.token.objects['valid'] = True
             reqclaims = json.loads(req.token.payload.decode('utf-8'))
+            print(f"got claims: {reqclaims}")
 
             reqtype = reqclaims['msgtype']
+            print(f"msgtype: {reqtype}")
             if reqtype == 'ctr_init': # カウンタの初期化
                 nonce = reqclaims['nonce']
                 client_pubkey = JWK.from_json(reqclaims['pubkey'])
@@ -105,12 +107,14 @@ class MCServer:
                     await write(writer, {'msgtype': 'error', 'info': 'invalid_signature'}, self.privkey)
                     return
 
-                nonce1 = random.randrange(2 ** 64)
+                nonce1 = random.randrange(2 ** 32)
                 await write(writer, {'msgtype': 'ctr_access_ack0', 'nonce0': nonce0, 'nonce1': nonce1}, self.privkey)
 
-                req1 = await read(client_pubkey)
+                req1 = await read(reader, client_pubkey)
+                print(f'req1: {req1.claims}')
                 # TODO: 署名検証の例外処理
                 req1claims = json.loads(req1.claims)
+                print(f'got claims: {req1claims}')
 
                 if req1claims['msgtype'] != 'ctr_access_ack1':
                     await write(writer, {'msgtype': 'error', 'info': 'invalid_request'}, self.privkey)
@@ -120,7 +124,7 @@ class MCServer:
                     return
 
                 v = self.data.increment(key, inc)
-                await write(writer, {'msgtype': 'ctr_access_ok', 'nonce0': nonce0, 'nonce1': nonce1, 'v': v}, self.privkey)
+                await write(writer, {'msgtype': 'ctr_access_ok', 'nonce0': nonce0, 'nonce1': nonce1, 'ctr': v}, self.privkey)
 
             elif reqtype == 'time_query': # 時刻のクエリ
                 # クエリの署名検証はしない
@@ -132,11 +136,14 @@ class MCServer:
             else: # 不明なリクエスト
                 await write(writer, {'msgtype': 'error', 'info': 'invalid_request'}, self.privkey)
 
-        except (KeyError, ValueError):
-            await write(writer, {'msgtype': 'error', 'info': 'invalid_request'}, self.privkey)
+        #except KeyError:
+        #    await write(writer, {'msgtype': 'error', 'info': 'key_error'}, self.privkey)
 
-        except InvalidJWSSignature:
-            await write(writer, {'msgtype': 'error', 'info': 'invalid_signature'}, self.privkey)
+        except ValueError:
+            await write(writer, {'msgtype': 'error', 'info': 'value_error'}, self.privkey)
+
+        #except InvalidJWSSignature:
+        #    await write(writer, {'msgtype': 'error', 'info': 'invalid_signature'}, self.privkey)
 
         finally:
             writer.close()
